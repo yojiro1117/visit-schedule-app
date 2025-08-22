@@ -2,8 +2,8 @@
 import streamlit as st
 import requests
 
-# APIキーをここに設定（セキュリティのため本番では環境変数管理を推奨）
-API_KEY = "AIzaSyCLNwG_rr1xvUhEwrkAcDKKc8XFdXgUpz8"
+# ✅ StreamlitのSecretsからAPIキーを安全に読み込む
+API_KEY = st.secrets["google_api"]["GOOGLE_API_KEY"]
 
 st.set_page_config(page_title="訪問先スケジュール入力", layout="centered")
 
