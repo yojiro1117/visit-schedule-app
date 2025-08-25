@@ -7,7 +7,7 @@ API_KEY = st.secrets["google_api"]["GOOGLE_API_KEY"]
 
 st.set_page_config(page_title="訪問先スケジュール入力", layout="centered")
 
-st.title("🗓️ 訪問スケジュール作成アプリ（API対応）")
+st.title("🗓️ 訪問スケジュール作成アプリ（API対応・デバッグ付き）")
 
 # 出発地入力
 origin = st.text_input("出発地（住所）", placeholder="例：福岡市中央区天神")
@@ -40,25 +40,32 @@ def get_travel_time(origin, destination):
     }
     res = requests.get(url, params=params)
     data = res.json()
+    st.write("📡 Google API レスポンス:", data)  # デバッグ用出力
     try:
         return data["routes"][0]["legs"][0]["duration"]["text"]
     except:
+        st.warning("⚠️ 所要時間の取得に失敗しました（ルートが見つからない可能性）")
         return "取得失敗"
 
 # 追加処理
-if submit and origin and name and address:
-    duration = get_travel_time(origin, address)
-    google_map_url = f"https://www.google.com/maps/dir/?api=1&origin={origin}&destination={address}&travelmode=driving"
+if submit:
+    st.write("✅ ボタンが押されました")
+    if origin and name and address:
+        st.write("✅ 入力チェックOK")
+        duration = get_travel_time(origin, address)
+        google_map_url = f"https://www.google.com/maps/dir/?api=1&origin={origin}&destination={address}&travelmode=driving"
 
-    st.session_state.schedule.append({
-        "訪問先": name,
-        "住所": address,
-        "所要時間": duration,
-        "滞在時間": f"{stay_time}分",
-        "備考": note,
-        "地図リンク": google_map_url
-    })
-    st.success("訪問先を追加しました")
+        st.session_state.schedule.append({
+            "訪問先": name,
+            "住所": address,
+            "所要時間": duration,
+            "滞在時間": f"{stay_time}分",
+            "備考": note,
+            "地図リンク": google_map_url
+        })
+        st.success("✅ 訪問先を追加しました")
+    else:
+        st.warning("⚠️ 入力が不足しています（出発地・名称・住所すべてが必要です）")
 
 # 表示
 if st.session_state.schedule:
