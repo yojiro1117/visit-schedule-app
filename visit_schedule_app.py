@@ -17,15 +17,10 @@ st.markdown("""
     background-size: cover;
     background-position: center;
 }
-/* サイドバー幅を拡大（おおよそ2倍相当） */
+/* 右カラム（一覧）を広めにとる */
 [data-testid="stSidebar"] {
     min-width: 430px;
     max-width: 430px;
-}
-/* サイドバー内コンテンツの読みやすさ向上 */
-[data-testid="stSidebar"] .block-container {
-    padding-top: 1rem;
-    padding-bottom: 2rem;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -43,14 +38,15 @@ if "schedule" not in st.session_state:
     # 各要素: {name, address, stay_min, note}
     st.session_state.schedule = []
 if "saved_origins" not in st.session_state:
-    st.session_state.saved_origins = []
+    st.session_state.saved_origins = []          # 登録済み出発地
+if "origin_select" not in st.session_state:
+    st.session_state.origin_select = "（新規入力）"  # プルダウン選択値
+if "origin_new" not in st.session_state:
+    st.session_state.origin_new = ""             # 新規入力値
 if "base_depart_date" not in st.session_state:
     st.session_state.base_depart_date = date.today()
 if "base_depart_time_str" not in st.session_state:
-    # "09:00" のような文字列で管理（プルダウン）
     st.session_state.base_depart_time_str = "09:00"
-if "selected_origin" not in st.session_state:
-    st.session_state.selected_origin = ""
 
 # ------------------------------------------------------------
 # 共通関数
@@ -59,7 +55,7 @@ def get_api_key():
     try:
         return st.secrets["google_api"]["GOOGLE_API_KEY"]
     except Exception:
-        return None  # 未設定でも動くように
+        return None  # 未設定でも動作継続
 
 def to_datetime(d: date, time_str: str) -> datetime:
     hh, mm = [int(x) for x in time_str.split(":")]
@@ -71,8 +67,6 @@ def unix_seconds(dt: datetime) -> int:
 def maps_url(origin: str, dest: str, mode: str, depart_dt: datetime):
     """
     GoogleマップURLを生成。出発時刻(departure_time)をUNIX秒で付与。
-    api=1 の URL 仕様は正式には departure_time をドキュメント化していませんが、
-    実地で反映されるケースが多いため付与します（将来仕様変更の可能性あり）。
     """
     params = {
         "api": "1",
@@ -105,35 +99,41 @@ def get_directions_duration_seconds(origin: str, dest: str, mode: str, depart_dt
     try:
         res = requests.get(url, params=params, timeout=20)
         data = res.json()
-        # デバッグしたい時:
-        # st.write("API:", data)
         legs = data["routes"][0]["legs"][0]
         return int(legs["duration"]["value"])  # 秒
     except Exception:
         return None
 
+def safe_int(x, default=0):
+    try:
+        return int(x)
+    except Exception:
+        return default
+
 def recalc_timeline(origin: str, base_depart_dt: datetime, mode: str, avoid_tolls: bool):
     """
     先頭から順に、出発 -> 到着 -> 滞在 -> 次の出発 を累積計算し、
-    schedule各要素に到着時刻・出発時刻・マップURL・所要時間を付与して返す。
+    schedule各要素に到着時刻・出発時刻・所要時間を付与して返す。
     """
     timeline = []
     cursor_depart = base_depart_dt
     current_origin = origin
 
     for item in st.session_state.schedule:
-        name = item["name"]
-        address = item["address"]
-        stay_min = int(item["stay_min"])
+        # 古いセッションのキーにも耐える
+        name = item.get("name") or item.get("訪問先名称") or item.get("訪問先") or ""
+        address = item.get("address") or item.get("住所") or ""
+        stay_min = safe_int(item.get("stay_min", item.get("滞在時間", item.get("stay_time", 0))), 0)
+        note = item.get("note", item.get("備考", ""))
 
         dest_for_api = address if address.strip() else name  # 住所が空でも名称で検索
+
         # 所要時間（秒）
         secs = get_directions_duration_seconds(current_origin, dest_for_api, mode, cursor_depart, avoid_tolls)
         duration_text = "取得失敗"
         if secs is None:
             secs = 0
         else:
-            # 「xx分」などの日本語表現
             mins = math.ceil(secs / 60)
             if mins < 60:
                 duration_text = f"{mins} 分"
@@ -145,14 +145,13 @@ def recalc_timeline(origin: str, base_depart_dt: datetime, mode: str, avoid_toll
         arrive_dt = cursor_depart + timedelta(seconds=secs)
         leave_dt  = arrive_dt + timedelta(minutes=stay_min)
 
-        # GoogleマップURL（この訪問の出発時刻cursor_departを反映）
         url = maps_url(current_origin, dest_for_api, mode, cursor_depart)
 
         timeline.append({
             "name": name,
             "address": address,
             "stay_min": stay_min,
-            "note": item["note"],
+            "note": note,
             "depart_at": cursor_depart,
             "arrive_at": arrive_dt,
             "leave_at": leave_dt,
@@ -160,43 +159,52 @@ def recalc_timeline(origin: str, base_depart_dt: datetime, mode: str, avoid_toll
             "map_url": url,
         })
 
-        # 次の訪問に向けてカーソルと現在地を更新
         cursor_depart = leave_dt
         current_origin = dest_for_api
 
     return timeline
 
 # ------------------------------------------------------------
-# 左：メイン入力、右：スケジュール表示（幅広）
+# レイアウト：左（入力）・右（一覧）
 # ------------------------------------------------------------
-left, right = st.columns([6, 6])  # サイドバー拡大につきメインも広め
+left, right = st.columns([6, 6])
 
 with left:
-    # 1) 出発地（登録＋選択）
+    # 1) 出発地（プルダウン + 新規入力）
     st.subheader("出発地")
-    col_o1, col_o2 = st.columns([4, 1])
-    with col_o1:
-        origin_input = st.text_input("出発地（住所）", value=st.session_state.selected_origin or "")
-    with col_o2:
-        if st.button("出発地登録", use_container_width=True):
-            if origin_input and (origin_input not in st.session_state.saved_origins):
-                st.session_state.saved_origins.insert(0, origin_input)
-                st.session_state.saved_origins = st.session_state.saved_origins[:10]  # 最大10件
-                st.success("出発地を登録しました")
 
-    if st.session_state.saved_origins:
-        st.session_state.selected_origin = st.selectbox(
-            "登録済み出発地", 
-            options=["（選択してください）"] + st.session_state.saved_origins,
-            index=0 if not st.session_state.selected_origin else
-                  (st.session_state.saved_origins.index(st.session_state.selected_origin) + 1),
-        )
-        if st.session_state.selected_origin == "（選択してください）":
-            st.session_state.selected_origin = origin_input
-    else:
-        st.session_state.selected_origin = origin_input
+    # プルダウン
+    options = ["（新規入力）"] + st.session_state.saved_origins
+    st.session_state.origin_select = st.selectbox(
+        "登録済み／新規入力の選択", options=options, index=options.index(st.session_state.origin_select) if st.session_state.origin_select in options else 0
+    )
 
-    # 2) 移動手段＋（車の時のみ有料道路回避）
+    # 新規入力欄（選択時のみ表示）
+    cols_origin = st.columns([4, 1])
+    with cols_origin[0]:
+        if st.session_state.origin_select == "（新規入力）":
+            st.session_state.origin_new = st.text_input("出発地を入力して保存", value=st.session_state.origin_new, placeholder="例：職場 / 福岡市中央区〜")
+        else:
+            st.text_input("出発地（編集不可／選択中）", value=st.session_state.origin_select, disabled=True)
+    with cols_origin[1]:
+        if st.button("保存", use_container_width=True):
+            if st.session_state.origin_select == "（新規入力）":
+                val = st.session_state.origin_new.strip()
+                if val:
+                    if val not in st.session_state.saved_origins:
+                        st.session_state.saved_origins.insert(0, val)
+                        st.session_state.saved_origins = st.session_state.saved_origins[:10]
+                    st.session_state.origin_select = val
+                    st.session_state.origin_new = ""
+                    st.success("出発地を保存しました")
+            else:
+                # 既存選択時はそのまま
+                st.info("選択済みの出発地を利用します")
+
+    # 現在の出発地（最終的に使う文字列）
+    current_origin = st.session_state.origin_select if st.session_state.origin_select != "（新規入力）" else st.session_state.origin_new
+
+    # 2) 移動手段
     st.subheader("移動手段")
     mode_label = st.radio("選択", ["車(Driving)", "徒歩(Walking)", "公共交通機関(Transit)"], horizontal=True)
     mode_map = {"車(Driving)": "driving", "徒歩(Walking)": "walking", "公共交通機関(Transit)": "transit"}
@@ -205,18 +213,18 @@ with left:
     if mode == "driving":
         avoid_tolls = st.checkbox("有料道路を避ける")
 
-    # 3) 出発日時（プルダウン：5分刻み）
+    # 3) 出発日時（左右に並べる）
     st.subheader("出発日時")
-    st.session_state.base_depart_date = st.date_input("出発日 (Departure Date)", value=st.session_state.base_depart_date)
-
-    # 5分刻みの時刻リスト
-    times = [f"{h:02d}:{m:02d}" for h in range(0, 24) for m in range(0, 60, 5)]
-    # 選択肢にない場合は近い5分へ
-    if st.session_state.base_depart_time_str not in times:
-        st.session_state.base_depart_time_str = "09:00"
-    st.session_state.base_depart_time_str = st.selectbox(
-        "出発時刻 (Departure Time)", options=times, index=times.index(st.session_state.base_depart_time_str)
-    )
+    col_d, col_t = st.columns(2)
+    with col_d:
+        st.session_state.base_depart_date = st.date_input("出発日 (Departure Date)", value=st.session_state.base_depart_date)
+    with col_t:
+        times = [f"{h:02d}:{m:02d}" for h in range(0, 24) for m in range(0, 60, 5)]
+        if st.session_state.base_depart_time_str not in times:
+            st.session_state.base_depart_time_str = "09:00"
+        st.session_state.base_depart_time_str = st.selectbox(
+            "出発時刻 (Departure Time)", options=times, index=times.index(st.session_state.base_depart_time_str)
+        )
 
     # 4) 訪問先の追加フォーム
     st.subheader("訪問先の追加")
@@ -227,7 +235,7 @@ with left:
         note = st.text_area("備考（任意・Remarks）", height=80)
         submitted = st.form_submit_button("追加する")
         if submitted:
-            if not name:
+            if not name.strip():
                 st.warning("⚠️ 名称が必要です")
             else:
                 st.session_state.schedule.append({
@@ -238,18 +246,18 @@ with left:
                 })
                 st.success("✅ 訪問先を追加しました")
 
-    # 5) スケジュールの再計算ボタン（出発地や時刻・交通手段を変えた場合に押下）
-    st.button("スケジュールを再計算", type="secondary")
-
 with right:
-    st.subheader("📋 スケジュール一覧（到着時刻を自動計算）")
+    st.subheader("🗒️ スケジュール一覧（到着時刻を自動計算）")
     if not st.session_state.schedule:
         st.info("訪問先はまだ登録されていません")
     else:
-        # 入力済みの全体タイムラインを計算して表示
         base_depart_dt = to_datetime(st.session_state.base_depart_date, st.session_state.base_depart_time_str)
-        origin = st.session_state.selected_origin or ""
-        tl = recalc_timeline(origin=origin, base_depart_dt=base_depart_dt, mode=mode, avoid_tolls=avoid_tolls)
+        tl = recalc_timeline(
+            origin=current_origin or "",
+            base_depart_dt=base_depart_dt,
+            mode=mode,
+            avoid_tolls=avoid_tolls
+        )
 
         for idx, row in enumerate(tl):
             with st.container(border=True):
@@ -269,23 +277,18 @@ with right:
                 cols = st.columns([1, 3])
                 with cols[0]:
                     if st.button("削除", key=f"del_{idx}", type="secondary"):
-                        # schedule から idx を削除
                         st.session_state.schedule.pop(idx)
                         st.experimental_rerun()
 
-        # まとめ: 最終到着・終了時刻を表示
         if tl:
             final_leave = tl[-1]["leave_at"]
             st.markdown("---")
             st.success(f"🟢 すべての訪問が終了する時刻：**{final_leave.strftime('%Y-%m-%d %H:%M')}**")
 
-# ------------------------------------------------------------
-# 使い方メモ（必要なら）
-# ------------------------------------------------------------
+# 使い方（省略可）
 with st.sidebar:
     st.header("📎 使い方")
-    st.markdown("- 出発地を入力して「出発地登録」で保存、またはドロップダウンから再利用できます。")
-    st.markdown("- 出発日・出発時刻・移動手段を選んでください。")
-    st.markdown("- 訪問先は「名称だけ」でも追加できます（地図・経路は名称検索）。")
-    st.markdown("- 右側に到着時刻・滞在・次出発時刻が自動計算されます。")
+    st.markdown("- 出発地はプルダウンで選択、または「新規入力」を選んで保存してください。")
+    st.markdown("- 出発日・出発時刻は左右に分けて選択します。")
+    st.markdown("- 訪問先は名称だけでも追加可（地図・経路は名称検索）。")
     st.markdown("- 各行の「削除」でその訪問先のみ削除できます。")
