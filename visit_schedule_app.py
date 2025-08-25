@@ -5,38 +5,32 @@ from datetime import datetime, date, timedelta
 import urllib.parse
 import math
 
-# ------------------------------------------------------------
-# ページ設定 & スタイル（背景地図 / 右側一覧を広め）
-# ------------------------------------------------------------
+# =========================
+#  ページ設定 & スタイル
+# =========================
 st.set_page_config(page_title="訪問スケジュール作成アプリ", layout="wide")
 st.markdown("""
 <style>
-/* 背景に落ち着いた世界地図 */
 [data-testid="stAppViewContainer"] {
-    background-image: url("https://upload.wikimedia.org/wikipedia/commons/8/80/World_map_-_low_resolution_gray_blue.png");
-    background-size: cover;
-    background-position: center;
+  background-image: url("https://upload.wikimedia.org/wikipedia/commons/8/80/World_map_-_low_resolution_gray_blue.png");
+  background-size: cover;
+  background-position: center;
 }
-/* 右側の一覧を広めにとる（サイドバーの2倍相当） */
 [data-testid="stSidebar"] { min-width: 430px; max-width: 430px; }
 </style>
 """, unsafe_allow_html=True)
 
-# ------------------------------------------------------------
-# タイトル
-# ------------------------------------------------------------
 st.markdown("<h1>🗓️ 訪問スケジュール作成アプリ</h1>", unsafe_allow_html=True)
 st.caption("API-Enabled + Debug Mode")
 
-# ------------------------------------------------------------
-# セッション初期化
-# ------------------------------------------------------------
+# =========================
+#  セッション初期化
+# =========================
 if "schedule" not in st.session_state:
-    # 各要素: {name, address, stay_min, note}
-    st.session_state.schedule = []
+    st.session_state.schedule = []  # {name, address, stay_min, note}
 
 if "saved_origins" not in st.session_state:
-    st.session_state.saved_origins = []  # 登録済み出発地（最大10件）
+    st.session_state.saved_origins = []
 
 if "origin_select" not in st.session_state:
     st.session_state.origin_select = "（新規入力…）"
@@ -50,50 +44,67 @@ if "base_depart_date" not in st.session_state:
 def _nearest5_str_now():
     now = datetime.now()
     add = (5 - (now.minute % 5)) % 5
-    if add != 0:
-        now = now + timedelta(minutes=add)
+    if add:
+        now += timedelta(minutes=add)
     if now.minute == 60:
-        now = now + timedelta(hours=1)
-        now = now.replace(minute=0)
+        now = now.replace(minute=0) + timedelta(hours=1)
     return f"{now.hour:02d}:{now.minute:02d}"
 
 if "base_depart_time_str" not in st.session_state:
     st.session_state.base_depart_time_str = _nearest5_str_now()
 
-# ------------------------------------------------------------
-# 共通関数
-# ------------------------------------------------------------
+# =========================
+#  共通関数
+# =========================
 def get_api_key():
     try:
         return st.secrets["google_api"]["GOOGLE_API_KEY"]
     except Exception:
-        return None  # 未設定でも動作継続
+        return None
 
 def unix_seconds(dt: datetime) -> int:
     return int(dt.timestamp())
 
 def maps_url(origin: str, dest: str, mode: str, depart_dt: datetime, transit_pref: str = "fewer_transfers"):
-    """
-    GoogleマップURLを生成。出発時刻(departure_time)をUNIX秒で付与。
-    Transit は乗換少なめ(= fewer_transfers)を指定。
-    origin/destination は place_id:xxxxx も可。
-    """
+    # 訪問先名称の直下に出すリンク用（出発時刻も含める）
     params = {
         "api": "1",
         "origin": origin,
         "destination": dest,
-        "travelmode": mode,  # driving|walking|transit
+        "travelmode": mode,
         "departure_time": str(unix_seconds(depart_dt)),
     }
     if mode == "transit":
         params["transit_routing_preference"] = transit_pref  # fewer_transfers|less_walking
-    return "https://www.google.com/maps/dir/?" + urllib.parse.urlencode(params, safe=":")  # safeで「:」保持
+    return "https://www.google.com/maps/dir/?" + urllib.parse.urlencode(params, safe=":")  # place_id: を壊さない
 
-def geocode_place(text: str):
-    """
-    Geocoding API で place_id を取得。成功時は "place_id:xxxx" を返す。
-    失敗時は None。
-    """
+# ---- Places/Geocoding の強化：place_id 正規化 ----
+def places_find_place_id(text: str):
+    """Places API (Find Place) で place_id を取得。"""
+    key = get_api_key()
+    if not key or not text.strip():
+        return None
+    url = "https://maps.googleapis.com/maps/api/place/findplacefromtext/json"
+    params = {
+        "input": text,
+        "inputtype": "textquery",
+        "fields": "place_id",
+        "language": "ja",
+        "region": "jp",
+        "key": key
+    }
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        js = r.json()
+        cands = js.get("candidates") or []
+        if cands and cands[0].get("place_id"):
+            return f"place_id:{cands[0]['place_id']}"
+    except Exception:
+        pass
+    return None
+
+def geocode_place_id(text: str):
+    """Geocoding API で place_id を取得。"""
     key = get_api_key()
     if not key or not text.strip():
         return None
@@ -102,53 +113,96 @@ def geocode_place(text: str):
     try:
         r = requests.get(url, params=params, timeout=15)
         js = r.json()
-        if js.get("results"):
-            pid = js["results"][0].get("place_id")
-            if pid:
-                return f"place_id:{pid}"
+        results = js.get("results") or []
+        if results and results[0].get("place_id"):
+            return f"place_id:{results[0]['place_id']}"
     except Exception:
         pass
     return None
 
 def normalize_for_api(text: str):
     """
-    Directions/Maps用にできる限りplace_idへ正規化。
-    失敗したら元の文字列を返す。
+    Directions/Maps 用に place_id へ正規化。
+    ① Geocoding → ② Places(FindPlace) → ③ そのまま文字列 の順にフォールバック。
     """
-    pid = geocode_place(text)
-    return pid if pid else text
+    # すでに place_id 形式ならそのまま
+    if text.startswith("place_id:"):
+        return text
+    pid = geocode_place_id(text)
+    if pid:
+        return pid
+    pid = places_find_place_id(text)
+    if pid:
+        return pid
+    return text  # 最後の手段
 
-def get_directions_duration_seconds(origin: str, dest: str, mode: str, depart_dt: datetime, avoid_tolls: bool):
+def get_directions_duration_seconds(origin: str, dest: str, mode: str, depart_dt: datetime, avoid_tolls: bool, debug: dict | None = None):
     """
-    Google Directions API で所要時間（秒）を取得。origin/destはplace_id:xxxも可。
+    Directions API で所要時間（秒）を取得。
+    失敗時は複数のフォールバックを試す。
+    debug に API のステータスなどを返す（UI の折りたたみで表示）。
     """
     key = get_api_key()
     if not key:
-        return None  # APIキーなしは計算不可
+        if debug is not None:
+            debug["note"] = "APIキー未設定"
+        return None
 
     url = "https://maps.googleapis.com/maps/api/directions/json"
-    params = {
-        "origin": origin,
-        "destination": dest,
-        "mode": mode,  # driving | walking | transit
-        "departure_time": unix_seconds(depart_dt),
-        "language": "ja",
-        "region": "jp",
-        "key": key,
-    }
-    if mode == "driving" and avoid_tolls:
-        params["avoid"] = "tolls"
-    if mode == "transit":
-        params["transit_routing_preference"] = "fewer_transfers"
 
-    try:
-        res = requests.get(url, params=params, timeout=20)
-        data = res.json()
-        # st.write(data)  # デバッグ用
-        legs = data["routes"][0]["legs"][0]
-        return int(legs["duration"]["value"])  # 秒
-    except Exception:
+    def _call(o, d):
+        params = {
+            "origin": o,
+            "destination": d,
+            "mode": mode,
+            "departure_time": unix_seconds(depart_dt),
+            "language": "ja",
+            "region": "jp",
+            "key": key,
+        }
+        if mode == "driving" and avoid_tolls:
+            params["avoid"] = "tolls"
+        if mode == "transit":
+            params["transit_routing_preference"] = "fewer_transfers"
+        try:
+            r = requests.get(url, params=params, timeout=20)
+            js = r.json()
+            if debug is not None:
+                debug["last_status"] = js.get("status")
+                debug["last_error"] = js.get("error_message")
+            routes = js.get("routes") or []
+            if routes:
+                legs = routes[0].get("legs") or []
+                if legs:
+                    dur = legs[0].get("duration")
+                    if dur and "value" in dur:
+                        return int(dur["value"])
+        except Exception as e:
+            if debug is not None:
+                debug["exception"] = str(e)
         return None
+
+    # 1) place_id 正規化を使って呼ぶ
+    secs = _call(origin, dest)
+    if secs is not None:
+        return secs
+
+    # 2) place_id で失敗することが稀にあるため “元の文字列” 同士も試す
+    o_raw = origin.split(":", 1)[1] if origin.startswith("place_id:") else origin
+    d_raw = dest.split(":", 1)[1] if dest.startswith("place_id:") else dest
+    secs = _call(o_raw, d_raw)
+    if secs is not None:
+        return secs
+
+    # 3) 片側だけ place_id → 文字列のミックスも試す
+    secs = _call(origin, d_raw)
+    if secs is not None:
+        return secs
+    secs = _call(o_raw, dest)
+    if secs is not None:
+        return secs
+
+    return None
 
 def safe_int(x, default=0):
     try:
@@ -156,20 +210,14 @@ def safe_int(x, default=0):
     except Exception:
         return default
 
-def recalc_timeline(origin_text: str, base_depart_dt: datetime, mode: str, avoid_tolls: bool):
-    """
-    出発から順に、到着・滞在・次出発を累積計算。
-    住所が曖昧でも place_id に正規化して Directions API を呼ぶことで成功率を高める。
-    """
-    # 出発地を正規化
-    current_origin_api = normalize_for_api(origin_text or "")
+def recalc_timeline(origin_text: str, base_depart_dt: datetime, mode: str, avoid_tolls: bool, show_debug: bool):
     current_origin_label = origin_text or ""
+    current_origin_api = normalize_for_api(current_origin_label)
 
     timeline = []
     cursor_depart = base_depart_dt
 
     for item in st.session_state.schedule:
-        # レガシーキーにも耐える
         name = item.get("name") or item.get("訪問先名称") or item.get("訪問先") or ""
         address = item.get("address") or item.get("住所") or ""
         stay_min = safe_int(item.get("stay_min", item.get("滞在時間", item.get("stay_time", 0))), 0)
@@ -178,23 +226,18 @@ def recalc_timeline(origin_text: str, base_depart_dt: datetime, mode: str, avoid
         dest_label = address if address.strip() else name
         dest_api = normalize_for_api(dest_label)
 
-        secs = get_directions_duration_seconds(current_origin_api, dest_api, mode, cursor_depart, avoid_tolls)
+        dbg = {}
+        secs = get_directions_duration_seconds(current_origin_api, dest_api, mode, cursor_depart, avoid_tolls, debug=dbg)
         duration_text = "取得失敗"
         if secs is None:
             secs = 0
         else:
             mins = math.ceil(secs / 60)
-            if mins < 60:
-                duration_text = f"{mins} 分"
-            else:
-                h = mins // 60
-                m = mins % 60
-                duration_text = f"{h} 時間 {m} 分" if m else f"{h} 時間"
+            duration_text = f"{mins} 分" if mins < 60 else f"{mins//60} 時間 {mins%60} 分" if mins % 60 else f"{mins//60} 時間"
 
         arrive_dt = cursor_depart + timedelta(seconds=secs)
         leave_dt  = arrive_dt + timedelta(minutes=stay_min)
 
-        # マップURL（訪問先名称の直下に置く想定）
         url = maps_url(current_origin_api, dest_api, mode, cursor_depart)
 
         timeline.append({
@@ -208,24 +251,23 @@ def recalc_timeline(origin_text: str, base_depart_dt: datetime, mode: str, avoid
             "leave_at": leave_dt,
             "duration_text": duration_text,
             "map_url": url,
+            "debug": dbg if show_debug else None
         })
 
-        # 次の起点を更新
         cursor_depart = leave_dt
-        current_origin_api = dest_api
         current_origin_label = dest_label
+        current_origin_api = dest_api
 
     return timeline
 
-# ------------------------------------------------------------
-# レイアウト：左（入力）・右（一覧）
-# ------------------------------------------------------------
+# =========================
+#  レイアウト
+# =========================
 left, right = st.columns([6, 6])
 
 with left:
-    # ── 出発地（1段で完結：プルダウン＋「新規入力…」） ──────────────────────────
+    # 出発地（1段）
     st.subheader("出発地")
-
     row1 = st.columns([3, 3, 1.2])
     with row1[0]:
         origin_options = ["（新規入力…）"] + st.session_state.saved_origins
@@ -252,20 +294,13 @@ with left:
             else:
                 st.info("選択中の出発地を使用します")
 
-    if st.session_state.origin_select == "（新規入力…）":
-        current_origin_text = st.session_state.origin_new.strip()
-    else:
-        current_origin_text = st.session_state.origin_select
-
-    # ── 移動手段 ─────────────────────────────────────────────
+    # 移動手段
     st.subheader("移動手段")
     mode_label = st.radio("選択", ["車(Driving)", "徒歩(Walking)", "公共交通機関(Transit)"], horizontal=True)
     mode = {"車(Driving)": "driving", "徒歩(Walking)": "walking", "公共交通機関(Transit)": "transit"}[mode_label]
-    avoid_tolls = False
-    if mode == "driving":
-        avoid_tolls = st.checkbox("有料道路を避ける")
+    avoid_tolls = st.checkbox("有料道路を避ける") if mode == "driving" else False
 
-    # ── 出発日時（左右に並べる / 初期は現在時刻5分切り上げ） ─────────────────────────
+    # 出発日時（左右並び）
     st.subheader("出発日時")
     col_d, col_t = st.columns(2)
     with col_d:
@@ -278,7 +313,9 @@ with left:
             "出発時刻 (Departure Time)", options=times, index=times.index(st.session_state.base_depart_time_str)
         )
 
-    # ── 訪問先の追加 ───────────────────────────────────────────
+    st.divider()
+
+    # 訪問先の追加
     st.subheader("訪問先の追加")
     with st.form("add_destination"):
         name = st.text_input("訪問先名称 (Name of destination)")
@@ -300,25 +337,33 @@ with left:
 
 with right:
     st.subheader("🗒️ スケジュール一覧（到着時刻を自動計算）")
+
     if not st.session_state.schedule:
         st.info("訪問先はまだ登録されていません")
     else:
-        base_dt = datetime.combine(st.session_state.base_depart_date,
-                                   datetime.strptime(st.session_state.base_depart_time_str, "%H:%M").time())
+        base_dt = datetime.combine(
+            st.session_state.base_depart_date,
+            datetime.strptime(st.session_state.base_depart_time_str, "%H:%M").time()
+        )
+        current_origin_text = (
+            st.session_state.origin_new.strip() if st.session_state.origin_select == "（新規入力…）"
+            else st.session_state.origin_select
+        )
+        show_debug = st.checkbox("デバッグ情報を表示", value=False)
         tl = recalc_timeline(
             origin_text=current_origin_text or "",
             base_depart_dt=base_dt,
             mode=mode,
-            avoid_tolls=avoid_tolls
+            avoid_tolls=avoid_tolls,
+            show_debug=show_debug
         )
 
         for idx, row in enumerate(tl):
             with st.container(border=True):
-                # タイトル
                 st.markdown(f"**{idx+1}. {row['name']}**")
-                # ② マップリンクを訪問先名称の直下に
+                # ★ 訪問先名称の直下にマップリンク（出発時刻つき）
                 st.markdown(f"[🌐 Googleマップを開く]({row['map_url']})")
-                # 詳細
+
                 st.write(f"📍 住所：{row['address'] or '（名称検索）'}")
                 st.write(
                     f"🚶 出発：{row['depart_at'].strftime('%Y-%m-%d %H:%M')} "
@@ -329,7 +374,11 @@ with right:
                 if row["note"]:
                     st.write(f"📝 備考：{row['note']}")
 
-                # 個別削除ボタン
+                # デバッグ情報（APIレスポンスのステータスなど）
+                if show_debug and row.get("debug"):
+                    with st.expander("デバッグ詳細"):
+                        st.json(row["debug"])
+
                 cols = st.columns([1, 3])
                 with cols[0]:
                     if st.button("削除", key=f"del_{idx}", type="secondary"):
@@ -337,15 +386,14 @@ with right:
                         st.experimental_rerun()
 
         if tl:
-            final_leave = tl[-1]["leave_at"]
-            st.markdown("---")
-            st.success(f"🟢 すべての訪問が終了する時刻：**{final_leave.strftime('%Y-%m-%d %H:%M')}**")
+            st.divider()
+            st.success(f"🟢 すべての訪問が終了する時刻：**{tl[-1]['leave_at'].strftime('%Y-%m-%d %H:%M')}**")
 
-# ─────────────────────────────────────────────────────────────
 # サイドバー（任意）
 with st.sidebar:
     st.header("📎 使い方")
-    st.markdown("- 出発地はプルダウンで選択、または「新規入力…」を選んで保存します。")
+    st.markdown("- 出発地はプルダウンで選択、または「新規入力…」を選んで保存します。保存するとプルダウンに直ちに反映されます。")
     st.markdown("- 出発日と出発時刻は左右に並べて選択します（初期値は現在時刻の5分切り上げ）。")
-    st.markdown("- 訪問先は名称だけでも追加可能（地図・経路は名称検索）。")
-    st.markdown("- 各行の「削除」でその訪問先のみ削除できます。")
+    st.markdown("- 訪問先は名称だけでも追加可能（地図・経路は名称検索または place_id 正規化で算出）。")
+    st.markdown("- 各訪問先のカード直下に **Googleマップリンク** を置いています（出発時刻が反映）。")
+    st.markdown("- 取得に失敗する場合は「デバッグ情報を表示」を ON にして、APIの status/error を確認してください。")
