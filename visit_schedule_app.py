@@ -1,113 +1,107 @@
-from datetime import datetime
 import streamlit as st
+import datetime
 import requests
+import urllib.parse
 
-st.set_page_config(
-    page_title="Visit Scheduler App",
-    layout="centered",
-    page_icon="🗓️",
-)
+# タイトル部分（英語表記だけ英語 + 小さめに）
+st.set_page_config(page_title="訪問スケジュール作成アプリ", layout="centered")
+st.title("📅 訪問スケジュール作成アプリ")
+st.caption("API-Enabled + Debug Mode")
 
-# 背景画像（世界地図）をCSSで設定
+# 背景（世界地図）
 st.markdown(
     """
     <style>
     .stApp {
-        background-image: url("https://upload.wikimedia.org/wikipedia/commons/6/6e/Physical_world_map_blank_without_borders.svg");
+        background-image: url("https://upload.wikimedia.org/wikipedia/commons/thumb/6/62/BlankMap-World.svg/2000px-BlankMap-World.svg.png");
         background-size: cover;
+        background-repeat: no-repeat;
         background-attachment: fixed;
-        background-position: center;
     }
     </style>
     """,
     unsafe_allow_html=True
 )
 
-st.title("🗓️ Visit Schedule App")
-st.caption("API-Enabled + Debug Mode")
+# 出発地候補リスト（最大10）
+preset_departures = ["自宅", "事務所", "福岡空港", "博多駅", "天神", "薬院駅", "大橋駅", "北九州空港", "久留米", "小倉駅"]
 
-# よく使う出発地（最大10件）
-common_origins = [
-    "自宅", "事務所", "福岡空港", "南筑駅", "天神", "薬院駅", "西新", "福岡市役所", "福岡ドーム", "百道浜"
-]
-origin_choice = st.selectbox("Departure Location", common_origins + ["Other"])
-origin = st.text_input("Enter departure manually", "") if origin_choice == "Other" else origin_choice
-
-# 移動手段
-mode = st.radio("Transportation Mode", ["Driving", "Walking", "Transit"], horizontal=True)
-
-if mode == "Driving":
-    avoid_tolls = st.checkbox("Avoid toll roads", value=False)
+# 出発地選択 or 自由入力
+selected_departure = st.selectbox("出発地（住所）", options=preset_departures + ["その他"])
+if selected_departure == "その他":
+    origin = st.text_input("出発地を入力してください", "")
 else:
-    avoid_tolls = False
+    origin = selected_departure
 
-# 出発日時
-departure_time = st.date_input("Departure Date", datetime.now().date())
-departure_hour = st.time_input("Departure Time", datetime.now().time())
+# 移動手段の選択
+mode = st.radio("移動手段（Transportation Mode）", ["Driving", "Walking", "Transit"], horizontal=True)
+avoid_tolls = False
+if mode == "Driving":
+    avoid_tolls = st.checkbox("有料道路を回避")
+
+# 出発日時の選択
+departure_date = st.date_input("出発日 (Departure Date)", datetime.date.today())
+departure_time = st.time_input("出発時刻 (Departure Time)", datetime.datetime.now().time())
 
 # 訪問先入力
-st.subheader("Add a Destination")
-with st.form("destination_form"):
-    name = st.text_input("Destination Name", placeholder="例：OO株式会社")
-    address = st.text_input("Address", placeholder="例：福岡市南筑区～")
-    stay_time = st.number_input("Stay Time (minutes)", min_value=0, value=20, step=5)
-    note = st.text_area("Note (optional)", height=70)
-    submit = st.form_submit_button("Add")
+st.markdown("### 訪問先の追加")
+name = st.text_input("訪問先名称", placeholder="例：○○株式会社")
+address = st.text_input("住所", placeholder="例：福岡市南筑区～")
+stay_time = st.number_input("滞在時間（分）", min_value=0, max_value=300, value=20, step=5)
+note = st.text_area("備考（任意）")
 
-# セッション初期化
+# スケジュール保存用ステート
 if "schedule" not in st.session_state:
     st.session_state.schedule = []
 
-# 移動時間取得（Google Directions API）
+# Google Maps API呼び出し（移動時間取得）
 def get_travel_time(origin, destination, mode, avoid_tolls):
-    api_key = st.secrets["google_api"]["GOOGLE_API_KEY"]
-    endpoint = "https://maps.googleapis.com/maps/api/directions/json"
+    base_url = "https://maps.googleapis.com/maps/api/directions/json"
     params = {
         "origin": origin,
         "destination": destination,
         "mode": mode.lower(),
-        "key": api_key,
-        "language": "ja"
+        "departure_time": "now",
+        "key": st.secrets["google_api"]["GOOGLE_API_KEY"]
     }
-    if avoid_tolls:
+    if mode == "Driving" and avoid_tolls:
         params["avoid"] = "tolls"
 
-    res = requests.get(endpoint, params=params)
+    res = requests.get(base_url, params=params)
     data = res.json()
     try:
-        return data["routes"][0]["legs"][0]["duration"]["text"]
+        duration = data["routes"][0]["legs"][0]["duration"]["text"]
+        return duration
     except:
-        return "不明"
+        st.warning("🚧 移動時間の取得に失敗しました")
+        return "取得失敗"
 
-# 追加処理
-if submit:
+# 「追加」ボタン押下時の処理
+if st.button("追加する"):
     if origin and name and address:
-        travel_time = get_travel_time(origin, address, mode, avoid_tolls)
-        google_map_url = f"https://www.google.com/maps/dir/?api=1&origin={origin}&destination={address}&travelmode={mode.lower()}"
-        if avoid_tolls and mode == "Driving":
-            google_map_url += "&avoid=tolls"
+        duration = get_travel_time(origin, address, mode, avoid_tolls)
+        gmap_url = f"https://www.google.com/maps/dir/?api=1&origin={urllib.parse.quote(origin)}&destination={urllib.parse.quote(address)}&travelmode={mode.lower()}"
 
         st.session_state.schedule.append({
-            "name": name,
-            "address": address,
-            "stay": stay_time,
-            "note": note,
-            "move_time": travel_time,
-            "url": google_map_url
+            "訪問先": name,
+            "住所": address,
+            "移動時間": duration,
+            "滞在時間": f"{stay_time}分",
+            "備考": note,
+            "地図リンク": gmap_url
         })
-        st.success("✅ Added successfully")
+        st.success("✅ 訪問先を追加しました")
     else:
-        st.warning("⚠️ Missing input. Please enter all required fields.")
+        st.warning("⚠️ 入力が不足しています（出発地・名称・住所すべてが必要です）")
 
-# スケジュール表示
+# 右側にスケジュール表示
 if st.session_state.schedule:
-    st.subheader("📂 Schedule Overview")
-    for i, item in enumerate(st.session_state.schedule):
-        st.markdown(f"**{i+1}. {item['name']}**")
-        st.markdown(f"- 📍 Address: {item['address']}")
-        st.markdown(f"- 🚗 Travel Time: {item['move_time']}")
-        st.markdown(f"- 🕒 Stay Time: {item['stay']} min")
-        if item["note"]:
-            st.markdown(f"- 📝 Note: {item['note']}")
-        st.markdown(f"[🌐 Open in Google Maps]({item['url']})")
+    st.markdown("---")
+    st.markdown("### 📋 現在のスケジュール")
+    for i, row in enumerate(st.session_state.schedule, 1):
+        st.markdown(f"**{i}. {row['訪問先']}** → **{row['住所']}**")
+        st.markdown(f"🕒 移動時間：{row['移動時間']} ／ 滞在：{row['滞在時間']}")
+        st.markdown(f"🔗 [Googleマップで表示]({row['地図リンク']})")
+        if row['備考']:
+            st.markdown(f"✏️ 備考：{row['備考']}")
         st.markdown("---")
